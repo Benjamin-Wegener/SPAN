@@ -28,9 +28,33 @@ Inspired by the paper:
 
 * ✅ Lightweight and fast for edge deployment
 
-## 📸 Demo
+## 📸 Details of Implementation
 
-Trains a model to upscale images **4x**, improving perceptual quality using a custom perceptual loss.
+Here are some points where the code might differ from the explicit details or focus of the paper:
+
+### Loss Function Specifics:
+
+Paper: The paper states, "We train the SPAN with L1 loss, which is widely adopted in SR tasks, combined with a perceptual loss. This hybrid loss function ensures that both pixel-wise accuracy and perceptual quality are optimized." It doesn't specify the exact perceptual loss (e.g., which VGG layer features are used) or the weighting.
+
+Code: The main.js and utils.js files explicitly implement a hybrid loss of MAE (Mean Absolute Error, equivalent to L1) and a lightweight VGG perceptual loss, with a specific VGG_LOSS_WEIGHT = 0.001. While consistent with the paper's general statement, the "lightweight" VGG and the specific weight are implementation choices not detailed in the paper.
+
+### Symmetric Activation Functions:
+
+Paper: The paper describes using "symmetric activation functions," providing tanh as an example for the attention module and noting that "we adopt LeakyReLU in the convolutional layers as the non-linear activation function for its efficiency."
+
+Code: The spanBlock in main.js uses tf.tanh for the symmetric attention, and LeakyReLU for other convolutional layers, which is consistent with the paper's description.
+
+### Specific Hyperparameters for Training:
+
+Paper: The paper mentions training details but might not list every hyperparameter with the exact value (e.g., initial learning rate, weight decay, specific learning rate decay schedule).
+
+Code: main.js defines precise hyperparameters such as EPOCHS = 500, BATCH_SIZE = 4, INITIAL_LEARNING_RATE = 1e-4, LEARNING_RATE_DECAY_EPOCHS = [200, 300], LEARNING_RATE_DECAY_FACTOR = 0.5, and WEIGHT_DECAY = 1e-4. These are concrete values chosen for this implementation, which might be specific to the TensorFlow.js environment or a particular experimental setup not fully detailed in the paper's general methodology.
+
+### Implementation Environment and Optimizations:
+
+Paper: The paper focuses on the model's theoretical design and performance on standard benchmarks, without specifying the underlying deep learning framework (e.g., TensorFlow, PyTorch) or specific hardware/software optimizations for deployment.
+
+Code: The readme.md and main.js clearly state this is a TensorFlow.js implementation with a "WebGPU-first backend (fallback to WebGL/CPU)." This is a significant technical detail related to the deployment and performance in a web environment, which is outside the scope of the core research presented in the paper.
 
 ## ▶️ Usage
 
