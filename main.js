@@ -1,4 +1,3 @@
-
 // Training Schedule - SPAN specific settings
 const EPOCHS = 1000000; // niter: 1000000 (from paper)
 const BATCH_SIZE = 4; // batch_size: min(64, floor(64 / 14)) = 4 (updated based on dataset size)
@@ -13,7 +12,7 @@ const ADAM_BETA1 = 0.9; // adam_beta1_G
 const ADAM_BETA2 = 0.99; // adam_beta2_G
 
 // Image Configuration - SPAN specific
-const INPUT_SIZE = 64; // input_size: 256 (HR) / 4 (upscaling factor) = 64 (LR)
+const INPUT_SIZE = 64; // input_size: 256 (HR) / 4 (upscaling factor) = 64 (LR) - Used for TRAINING ONLY
 const GT_SIZE = 256; // gt_size: 256 (HR) (from paper)
 const UPSCALING_FACTOR = 4; // scale: 4
 const CH_SIZE = 3; // ch_size: 3
@@ -61,8 +60,8 @@ let pauseTrainingFlag = false; // New flag for pausing
 // Backend selection is now handled internally
 let currentBackend = '';
 
-// Global models
 let generatorModel;
+
 
 // --- Start of utils.js functions integrated into main.js ---
 
@@ -547,40 +546,31 @@ function formatTime(totalSeconds) {
 
 
 // ---------------------------------------------------------------------------
-// USER-PROVIDED PIXELSHUFFLE (DepthToSpace) IMPLEMENTATION
+// PIXELSHUFFLE (DepthToSpace) IMPLEMENTATION (FROM DEBUG.JS)
 // ---------------------------------------------------------------------------
 
 /**
- * Manual implementation of spaceToDepth operation.
- * This is used for the custom gradient of DepthToSpace.
+ * Manual implementation of spaceToDepth, used for the custom gradient.
  */
 function spaceToDepthManual(x, blockSize, dataFormat = 'NHWC') {
     return tf.tidy(() => {
         const inputShape = x.shape;
         if (dataFormat === 'NHWC') {
             const [batch, height, width, channels] = inputShape;
-            if (height % blockSize !== 0 || width % blockSize !== 0) throw new Error(`Height (${height}) and width (${width}) must be divisible by blockSize (${blockSize})`);
             const newHeight = height / blockSize;
             const newWidth = width / blockSize;
-            const newChannels = channels * blockSize * blockSize;
+            const newChannels = channels * (blockSize * blockSize);
             const reshaped1 = x.reshape([batch, newHeight, blockSize, newWidth, blockSize, channels]);
             const transposed = reshaped1.transpose([0, 1, 3, 2, 4, 5]);
             return transposed.reshape([batch, newHeight, newWidth, newChannels]);
-        } else { // NCHW
-            const [batch, channels, height, width] = inputShape;
-            if (height % blockSize !== 0 || width % blockSize !== 0) throw new Error(`Height (${height}) and width (${width}) must be divisible by blockSize (${blockSize})`);
-            const newHeight = height / blockSize;
-            const newWidth = width / blockSize;
-            const newChannels = channels * blockSize * blockSize;
-            const reshaped1 = x.reshape([batch, channels, newHeight, blockSize, newWidth, blockSize]);
-            const transposed = reshaped1.transpose([0, 1, 3, 5, 2, 4]);
-            return transposed.reshape([batch, newChannels, newHeight, newWidth]);
+        } else {
+            throw new Error("NCHW format not supported in this simplified debug script.");
         }
     });
 }
 
 /**
- * Register custom gradient for DepthToSpace operation.
+ * Registers a custom gradient for the DepthToSpace operation.
  */
 function registerDepthToSpaceGradient() {
     tf.registerGradient({
@@ -592,14 +582,13 @@ function registerDepthToSpaceGradient() {
 }
 
 /**
- * Custom TensorFlow.js layer for DepthToSpace operation (PixelShuffle equivalent).
+ * Custom TensorFlow.js layer for DepthToSpace (PixelShuffle).
  */
 class DepthToSpaceLayer extends tf.layers.Layer {
-    static className = 'DepthToSpaceLayer';
     constructor(config) {
         super(config);
         this.blockSize = config.blockSize;
-        this.dataFormat = config.dataFormat || 'NHWC'; // Default to NHWC for tfjs
+        this.dataFormat = config.dataFormat || 'NHWC';
     }
 
     call(inputs) {
@@ -607,197 +596,220 @@ class DepthToSpaceLayer extends tf.layers.Layer {
     }
 
     computeOutputShape(inputShape) {
+        if (Array.isArray(inputShape[0])) {
+            inputShape = inputShape[0];
+        }
         const [batch, height, width, channels] = inputShape;
         const newHeight = height ? height * this.blockSize : null;
         const newWidth = width ? width * this.blockSize : null;
-        const newChannels = channels / (this.blockSize * this.blockSize);
-        if (!Number.isInteger(newChannels)) {
-            throw new Error(`Invalid input channels for DepthToSpaceLayer. Must be divisible by blockSize^2.`);
+        const newChannels = channels ? channels / (this.blockSize * this.blockSize) : null;
+        if (channels !== null && newChannels !== null && !Number.isInteger(newChannels)) {
+            throw new Error(`Input channels must be divisible by blockSize^2.`);
         }
         return [batch, newHeight, newWidth, newChannels];
-    }
-
-    getClassName() {
-        return 'DepthToSpaceLayer';
     }
 
     getConfig() {
         const config = super.getConfig();
         Object.assign(config, {
             blockSize: this.blockSize,
-            dataFormat: this.dataFormat,
-            name: this.name
+            dataFormat: this.dataFormat
         });
         return config;
     }
+
+    static get className() {
+        return 'DepthToSpaceLayer';
+    }
 }
+tf.serialization.registerClass(DepthToSpaceLayer);
 
 
 // ---------------------------------------------------------------------------
-// SPAN MODEL IMPLEMENTATION
+// SPAN MODEL CUSTOM LAYERS (FROM DEBUG.JS)
 // ---------------------------------------------------------------------------
 
 /**
- * Custom layer to normalize input by subtracting a mean and dividing by a range.
+ * Normalizes input by subtracting a mean and dividing by a range.
  */
 class NormalizationLayer extends tf.layers.Layer {
     constructor(config) {
         super(config);
-        this.mean = config.mean;
-        this.range = config.range;
+        this.mean = config.mean || [0, 0, 0];
+        this.range = config.range || 1.0;
     }
-
+    
     call(inputs) {
         const inputTensor = Array.isArray(inputs) ? inputs[0] : inputs;
-        const normalized = tf.sub(inputTensor, this.mean);
-        return tf.div(normalized, this.range);
+        return tf.tidy(() => {
+            // NOTE: Assuming RGB mean is the same for all channels for simplicity here.
+            // A more complex implementation would handle per-channel means.
+            const meanTensor = tf.scalar(this.mean[0]);
+            const rangeTensor = tf.scalar(this.range);
+            return tf.div(tf.sub(inputTensor, meanTensor), rangeTensor);
+        });
     }
-
+    
+    computeOutputShape(inputShape) {
+        return Array.isArray(inputShape[0]) ? inputShape[0] : inputShape;
+    }
+    
+    getConfig() {
+        const config = super.getConfig();
+        config.mean = this.mean;
+        config.range = this.range;
+        return config;
+    }
+    
     static get className() {
         return 'NormalizationLayer';
     }
-
-    getConfig() {
-        const config = super.getConfig();
-        Object.assign(config, { 
-            mean: this.mean, 
-            range: this.range,
-            name: this.name
-        });
-        return config;
-    }
 }
+tf.serialization.registerClass(NormalizationLayer);
 
 /**
- * Custom layer to subtract 0.5 from the input tensor.
- * This replaces the deprecated tf.layers.lambda.
+ * Subtracts 0.5 from the input tensor.
  */
 class SubtractHalfLayer extends tf.layers.Layer {
     constructor(config) {
         super(config || {});
     }
+    
+    call(inputs) {
+        const inputTensor = Array.isArray(inputs) ? inputs[0] : inputs;
+        return tf.tidy(() => tf.sub(inputTensor, 0.5));
+    }
+    
+    computeOutputShape(inputShape) {
+        return Array.isArray(inputShape[0]) ? inputShape[0] : inputShape;
+    }
+    
+    getConfig() {
+        return super.getConfig();
+    }
+    
+    static get className() {
+        return 'SubtractHalfLayer';
+    }
+}
+tf.serialization.registerClass(SubtractHalfLayer);
+
+/**
+ * Custom fused convolutional layer (Conv3XC).
+ */
+class Conv3XC extends tf.layers.Layer {
+    constructor(config) {
+        super(config);
+        // Ensure we have proper defaults and handle multiple naming conventions
+        this.c_in = config.c_in || config.cIn || config.inputChannels;
+        this.c_out = config.c_out || config.cOut || config.outputChannels;
+        this.gain = config.gain1 || config.gain || 1;
+        this.s = config.s || config.stride || 1;
+        this.has_relu = config.relu || false;
+        this.use_bias = config.bias !== false;
+        
+        // Validate parameters
+        if (!this.c_in || !this.c_out || isNaN(this.c_in) || isNaN(this.c_out)) {
+            throw new Error(`Conv3XC: Invalid channel dimensions. c_in: ${this.c_in}, c_out: ${this.c_out}`);
+        }
+    }
+
+    build(inputShape) {
+        // Handle different input shape formats
+        if (Array.isArray(inputShape[0])) {
+            inputShape = inputShape[0];
+        }
+        
+        // Validate input shape
+        if (!inputShape || inputShape.length < 4) {
+            // This can happen during model loading, but our weights depend on constructor args, so it's okay.
+            console.warn(`Conv3XC: Received incomplete input shape during build: ${inputShape}. Proceeding with config values.`);
+        }
+        
+        // Ensure all dimensions are valid numbers
+        const c_in_val = parseInt(this.c_in);
+        const c_out_val = parseInt(this.c_out);
+        const gain_val = parseInt(this.gain);
+        
+        if (isNaN(c_in_val) || isNaN(c_out_val) || isNaN(gain_val)) {
+            throw new Error(`Conv3XC: Invalid parameters - c_in: ${c_in_val}, c_out: ${c_out_val}, gain: ${gain_val}`);
+        }
+        
+        // Create weights with validated dimensions
+        this.conv1_kernel = this.addWeight('conv1_kernel', [1, 1, c_in_val, c_in_val * gain_val], 'float32', tf.initializers.glorotUniform());
+        this.conv2_kernel = this.addWeight('conv2_kernel', [3, 3, c_in_val * gain_val, c_out_val * gain_val], 'float32', tf.initializers.glorotUniform());
+        this.conv3_kernel = this.addWeight('conv3_kernel', [1, 1, c_out_val * gain_val, c_out_val], 'float32', tf.initializers.glorotUniform());
+        this.sk_kernel = this.addWeight('sk_kernel', [1, 1, c_in_val, c_out_val], 'float32', tf.initializers.glorotUniform());
+        
+        if (this.use_bias) {
+            this.conv1_bias = this.addWeight('conv1_bias', [c_in_val * gain_val], 'float32', tf.initializers.zeros());
+            this.conv2_bias = this.addWeight('conv2_bias', [c_out_val * gain_val], 'float32', tf.initializers.zeros());
+            this.conv3_bias = this.addWeight('conv3_bias', [c_out_val], 'float32', tf.initializers.zeros());
+            this.sk_bias = this.addWeight('sk_bias', [c_out_val], 'float32', tf.initializers.zeros());
+        }
+        
+        super.build(inputShape);
+    }
 
     call(inputs) {
         return tf.tidy(() => {
-            const inputTensor = Array.isArray(inputs) ? inputs[0] : inputs;
-            return tf.sub(inputTensor, 0.5);
+            const x = Array.isArray(inputs) ? inputs[0] : inputs;
+            
+            // Main path
+            let main = tf.conv2d(x, this.conv1_kernel.read(), 1, 'same');
+            if (this.use_bias) {
+                main = tf.add(main, this.conv1_bias.read());
+            }
+            
+            main = tf.conv2d(main, this.conv2_kernel.read(), this.s, 'same');
+            if (this.use_bias) {
+                main = tf.add(main, this.conv2_bias.read());
+            }
+            
+            main = tf.conv2d(main, this.conv3_kernel.read(), 1, 'same');
+            if (this.use_bias) {
+                main = tf.add(main, this.conv3_bias.read());
+            }
+            
+            // Skip connection
+            let skip = tf.conv2d(x, this.sk_kernel.read(), this.s, 'same');
+            if (this.use_bias) {
+                skip = tf.add(skip, this.sk_bias.read());
+            }
+            
+            // Combine
+            let out = tf.add(main, skip);
+            if (this.has_relu) {
+                out = tf.leakyRelu(out, 0.05);
+            }
+            return out;
         });
     }
 
-    static get className() {
-        return 'SubtractHalfLayer';
+    computeOutputShape(inputShape) {
+        if (Array.isArray(inputShape[0])) {
+            inputShape = inputShape[0];
+        }
+        const [batch, height, width] = inputShape;
+        return [batch, height ? Math.floor(height / this.s) : null, width ? Math.floor(width / this.s) : null, this.c_out];
     }
 
     getConfig() {
         const config = super.getConfig();
-        Object.assign(config, { name: this.name });
+        config.c_in = parseInt(this.c_in);
+        config.c_out = parseInt(this.c_out);
+        config.gain1 = parseInt(this.gain);
+        config.s = parseInt(this.s);
+        config.relu = this.has_relu;
+        config.bias = this.use_bias;
         return config;
     }
-}
-
-
-/**
- * A custom convolutional layer that fuses multiple convolutions.
- * NOTE: This is a simplified version for training only. The original code's
- * weight fusion for inference was incorrect and has been removed for clarity
- * and correctness during training.
- */
-class Conv3XC extends tf.layers.Layer {
-    constructor(config) {
-        super(config); // Call super first
-        this.c_in = config.c_in; // Ensure this is defined
-        this.c_out = config.c_out;
-        this.gain = config.gain1 !== undefined ? config.gain1 : 1; // Default if missing
-        this.s = config.s !== undefined ? config.s : 1;
-        this.has_relu = config.relu !== undefined ? config.relu : false;
-        this.use_bias = config.bias !== undefined ? config.bias : true;
-    }
-
-    build(inputShape) {
-        // Define layers for the main branch
-        this.conv1 = tf.layers.conv2d({
-            filters: this.c_in * this.gain,
-            kernelSize: 1,
-            padding: 'same',
-            useBias: this.use_bias,
-            name: this.name + '_conv1'
-        });
-        this.conv2 = tf.layers.conv2d({
-            filters: this.c_out * this.gain,
-            kernelSize: 3,
-            strides: this.s,
-            padding: 'same',
-            useBias: this.use_bias,
-            name: this.name + '_conv2'
-        });
-        this.conv3 = tf.layers.conv2d({
-            filters: this.c_out,
-            kernelSize: 1,
-            padding: 'same',
-            useBias: this.use_bias,
-            name: this.name + '_conv3'
-        });
-
-        // Define layer for the skip connection branch
-        this.sk_conv = tf.layers.conv2d({
-            filters: this.c_out,
-            kernelSize: 1,
-            strides: this.s,
-            padding: 'same',
-            useBias: this.use_bias,
-            name: this.name + '_sk_conv'
-        });
-        
-        if (this.has_relu) {
-            this.reluLayer = tf.layers.leakyReLU({ alpha: 0.05 });
-        }
-
-        super.build(inputShape);
-    }
-
-    call(inputs, kwargs) {
-        const x = Array.isArray(inputs) ? inputs[0] : inputs;
-
-        // --- Main Path ---
-        let main_branch = this.conv1.apply(x);
-        main_branch = this.conv2.apply(main_branch);
-        main_branch = this.conv3.apply(main_branch);
-
-        // --- Skip Connection Path ---
-        const sk_branch = this.sk_conv.apply(x);
-
-        // --- Add and apply activation ---
-        let out = tf.layers.add().apply([main_branch, sk_branch]);
-
-        if (this.has_relu) {
-            out = this.reluLayer.apply(out);
-        }
-        return out;
-    }
-
-    // The inference-specific logic (updateParams) has been removed as it was
-    // implemented incorrectly and is not needed to fix the training error.
-    // A proper implementation would require careful kernel math to fuse the weights
-    // from the training layers into a single convolution.
-
+    
     static get className() {
         return 'Conv3XC';
     }
-
-    getConfig() {
-        const config = super.getConfig(); // Ensure base class config is included
-        return {
-            ...config, // Spread base class config
-            c_in: this.c_in,
-            c_out: this.c_out,
-            gain1: this.gain,
-            s: this.s,
-            relu: this.has_relu,
-            bias: this.use_bias,
-            name: this.name // Ensure name is preserved
-        };
-    }
 }
+tf.serialization.registerClass(Conv3XC);
 
 /**
  * The Swift Parameter-free Attention Block (SPAB).
@@ -805,68 +817,93 @@ class Conv3XC extends tf.layers.Layer {
 class SPAB extends tf.layers.Layer {
     constructor(config) {
         super(config);
-        this.in_channels = config.in_channels;
-        this.mid_channels = config.mid_channels || config.in_channels;
-        this.out_channels = config.out_channels || config.in_channels;
+        // Handle multiple naming conventions and provide defaults
+        this.in_channels = config.in_channels || config.inChannels || config.inputChannels;
+        this.mid_channels = config.mid_channels || config.midChannels || this.in_channels;
+        this.out_channels = config.out_channels || config.outChannels || config.outputChannels || this.in_channels;
         this.use_bias = config.bias !== false;
+        
+        // Validate parameters
+        if (!this.in_channels || isNaN(this.in_channels)) {
+            throw new Error(`SPAB: Invalid in_channels: ${this.in_channels}`);
+        }
+        
+        // Ensure all values are integers
+        this.in_channels = parseInt(this.in_channels);
+        this.mid_channels = parseInt(this.mid_channels);
+        this.out_channels = parseInt(this.out_channels);
+        
+        if (isNaN(this.in_channels) || isNaN(this.mid_channels) || isNaN(this.out_channels)) {
+            throw new Error(`SPAB: Invalid channel dimensions after parsing - in: ${this.in_channels}, mid: ${this.mid_channels}, out: ${this.out_channels}`);
+        }
     }
 
     build(inputShape) {
-        super.build(inputShape);
-        const in_channels = inputShape[3];
-        this.c1_r = new Conv3XC({
-            name: this.name + '_c1_r',
-            c_in: in_channels,
-            c_out: this.mid_channels,
-            gain1: 2,
-            s: 1,
-            bias: this.use_bias
+        // Handle different input shape formats
+        if (Array.isArray(inputShape[0])) {
+            inputShape = inputShape[0];
+        }
+        
+        // IMPORTANT: Use the reliable channel counts from the constructor, NOT from inputShape,
+        // as inputShape can be incomplete during model loading.
+        this.c1_r = new Conv3XC({ 
+            name: `${this.name}_c1`, 
+            c_in: this.in_channels, 
+            c_out: this.mid_channels, 
+            gain1: 2, 
+            bias: this.use_bias 
         });
-        this.c2_r = new Conv3XC({
-            name: this.name + '_c2_r',
-            c_in: this.mid_channels,
-            c_out: this.mid_channels,
-            gain1: 2,
-            s: 1,
-            bias: this.use_bias
+        this.c2_r = new Conv3XC({ 
+            name: `${this.name}_c2`, 
+            c_in: this.mid_channels, 
+            c_out: this.mid_channels, 
+            gain1: 2, 
+            bias: this.use_bias 
         });
-        this.c3_r = new Conv3XC({
-            name: this.name + '_c3_r',
-            c_in: this.mid_channels,
-            c_out: this.out_channels,
-            gain1: 2,
-            s: 1,
-            bias: this.use_bias
+        this.c3_r = new Conv3XC({ 
+            name: `${this.name}_c3`, 
+            c_in: this.mid_channels, 
+            c_out: this.out_channels, 
+            gain1: 2, 
+            bias: this.use_bias 
         });
         this.subtractLayer = new SubtractHalfLayer();
-    }
-
-    call(inputs, kwargs) {
-        const x = Array.isArray(inputs) ? inputs[0] : inputs;
-
-        const out1 = this.c1_r.apply(x, kwargs);
-        const out1_act = tf.layers.activation({activation: 'swish'}).apply(out1);
-
-        const out2 = this.c2_r.apply(out1_act, kwargs);
-        const out2_act = tf.layers.activation({activation: 'swish'}).apply(out2);
-
-        const out3 = this.c3_r.apply(out2_act, kwargs);
-
-        const sigmoid_out3 = tf.layers.activation({activation: 'sigmoid'}).apply(out3);
         
-        const sim_att = this.subtractLayer.apply(sigmoid_out3);
-
-        const added_features = tf.layers.add().apply([out3, x]);
-        const out = tf.layers.multiply().apply([added_features, sim_att]);
-
-        return [out, out1, sim_att];
+        // Build the sublayers with proper shapes
+        this.c1_r.build(inputShape);
+        this.c2_r.build([null, null, null, this.mid_channels]);
+        this.c3_r.build([null, null, null, this.mid_channels]);
+        this.subtractLayer.build([null, null, null, this.out_channels]);
+        
+        super.build(inputShape);
     }
 
-    static get className() {
-        return 'SPAB';
+    call(inputs) {
+        return tf.tidy(() => {
+            const x = Array.isArray(inputs) ? inputs[0] : inputs;
+            
+            // Use the .call() method for direct execution, which is clearer than .apply() here.
+            const out1 = this.c1_r.call(x);
+            const out1_act = tf.layers.activation({ activation: 'swish' }).apply(out1);
+            
+            const out2 = this.c2_r.call(out1_act);
+            const out2_act = tf.layers.activation({ activation: 'swish' }).apply(out2);
+            
+            const out3 = this.c3_r.call(out2_act);
+            const sigmoid_out = tf.layers.activation({ activation: 'sigmoid' }).apply(out3);
+            const sim_att = this.subtractLayer.call(sigmoid_out);
+            
+            const added_features = tf.add(out3, x);
+            const out = tf.mul(added_features, sim_att);
+            
+            return [out, out1, sim_att];
+        });
     }
 
     computeOutputShape(inputShape) {
+        if (Array.isArray(inputShape[0])) {
+            inputShape = inputShape[0];
+        }
         const [batch, height, width] = inputShape;
         return [
             [batch, height, width, this.out_channels],
@@ -877,93 +914,164 @@ class SPAB extends tf.layers.Layer {
 
     getConfig() {
         const config = super.getConfig();
-        Object.assign(config, {
-            in_channels: this.in_channels,
-            mid_channels: this.mid_channels,
-            out_channels: this.out_channels,
-            bias: this.use_bias,
-            name: this.name
-        });
+        config.in_channels = parseInt(this.in_channels);
+        config.mid_channels = parseInt(this.mid_channels);
+        config.out_channels = parseInt(this.out_channels);
+        config.bias = this.use_bias;
         return config;
     }
+    
+    static get className() {
+        return 'SPAB';
+    }
 }
+tf.serialization.registerClass(SPAB);
 
 
+// ---------------------------------------------------------------------------
+// SPAN MODEL DEFINITION (FROM DEBUG.JS)
+// ---------------------------------------------------------------------------
 
 /**
- * Creates the main SPAN model using the TensorFlow.js Functional API.
- * @param {object} config - The model configuration.
- * @returns {tf.LayersModel} A TensorFlow.js Layers Model.
+ * Creates the main SPAN model architecture.
+ * @param {object} config - Model configuration parameters.
+ * @param {number} [height=INPUT_SIZE] - The input height for the model.
+ * @param {number} [width=INPUT_SIZE] - The input width for the model.
  */
-function createSPANModel(config) {
-    const {
-        num_in_ch,
-        num_out_ch,
-        feature_channels = 48,
-        upscale = 4,
-        bias = true,
+function createSPANModel(config, height = INPUT_SIZE, width = INPUT_SIZE) {
+    const { 
+        num_in_ch, 
+        num_out_ch, 
+        feature_channels = 48, 
+        upscale = 4, 
+        bias = true, 
         img_range = 1.0, 
-        rgb_mean = [0.0, 0.0, 0.0]
+        rgb_mean = [0, 0, 0] 
     } = config;
+    
+    // Validate all parameters
+    if (!num_in_ch || !num_out_ch || !feature_channels || isNaN(num_in_ch) || isNaN(num_out_ch) || isNaN(feature_channels)) {
+        throw new Error(`Invalid model parameters: num_in_ch=${num_in_ch}, num_out_ch=${num_out_ch}, feature_channels=${feature_channels}`);
+    }
+    
+    console.log(`Creating SPAN model for input size ${height}x${width} with parameters:`, {
+        num_in_ch, num_out_ch, feature_channels, upscale, bias
+    });
+    
 
-    const inputs = tf.input({ shape: [null, null, num_in_ch] });
-
-    const normalized_input = new NormalizationLayer({
-        name: 'input_normalization',
-        mean: rgb_mean,
-        range: img_range
+    const inputs = tf.input({ shape: [height, width, num_in_ch], name: 'input1' });
+    
+    const norm = new NormalizationLayer({ 
+        name: 'norm', 
+        mean: rgb_mean, 
+        range: img_range 
     }).apply(inputs);
-
-    const conv_1 = new Conv3XC({
-        name: 'conv_1', c_in: num_in_ch, c_out: feature_channels, gain1: 2, s: 1, bias: bias
-    }).apply(normalized_input);
-
-    const [out_b1, , ] = new SPAB({ name: 'block_1', in_channels: feature_channels, bias: bias }).apply(conv_1);
-    const [out_b2, , ] = new SPAB({ name: 'block_2', in_channels: feature_channels, bias: bias }).apply(out_b1);
-    const [out_b3, , ] = new SPAB({ name: 'block_3', in_channels: feature_channels, bias: bias }).apply(out_b2);
-    const [out_b4, , ] = new SPAB({ name: 'block_4', in_channels: feature_channels, bias: bias }).apply(out_b3);
-    const [out_b5, , ] = new SPAB({ name: 'block_5', in_channels: feature_channels, bias: bias }).apply(out_b4);
-    const [out_b6, out_b5_2, ] = new SPAB({ name: 'block_6', in_channels: feature_channels, bias: bias }).apply(out_b5);
-
-    const conv_2 = new Conv3XC({
-        name: 'conv_2', c_in: feature_channels, c_out: feature_channels, gain1: 2, s: 1, bias: bias
-    }).apply(out_b6);
-
-    // FIX: Concatenate the normalized_input (3 channels) instead of conv_1 (48 channels)
-    // to match the expected input shape (147 channels) of the pre-trained conv_cat layer.
-    // Calculation: 3 (normalized_input) + 48 (conv_2) + 48 (out_b1) + 48 (out_b5_2) = 147 channels.
-    const cat_features = tf.layers.concatenate({ name: 'feature_cat', axis: -1 }).apply([normalized_input, conv_2, out_b1, out_b5_2]);
-
-    const conv_cat = tf.layers.conv2d({
-        name: 'conv_cat', filters: feature_channels, kernelSize: 1, padding: 'same', useBias: bias
-    }).apply(cat_features);
-
-    const upsampler_conv = tf.layers.conv2d({
-        name: 'upsampler_conv', filters: num_out_ch * (upscale ** 2), kernelSize: 3, padding: 'same', useBias: true
+    
+    const conv1 = new Conv3XC({ 
+        name: 'conv_1', 
+        c_in: num_in_ch, 
+        c_out: feature_channels, 
+        gain1: 2, 
+        bias: bias 
+    }).apply(norm);
+    
+    const [b1_out, , ] = new SPAB({ 
+        name: 'spab_1', 
+        in_channels: feature_channels, 
+        mid_channels: feature_channels,
+        out_channels: feature_channels,
+        bias: bias 
+    }).apply(conv1);
+    
+    const [b2_out, , ] = new SPAB({ 
+        name: 'spab_2', 
+        in_channels: feature_channels, 
+        mid_channels: feature_channels,
+        out_channels: feature_channels,
+        bias: bias 
+    }).apply(b1_out);
+    
+    const [b3_out, , ] = new SPAB({ 
+        name: 'spab_3', 
+        in_channels: feature_channels, 
+        mid_channels: feature_channels,
+        out_channels: feature_channels,
+        bias: bias 
+    }).apply(b2_out);
+    
+    const [b4_out, , ] = new SPAB({ 
+        name: 'spab_4', 
+        in_channels: feature_channels, 
+        mid_channels: feature_channels,
+        out_channels: feature_channels,
+        bias: bias 
+    }).apply(b3_out);
+    
+    const [b5_out, , ] = new SPAB({ 
+        name: 'spab_5', 
+        in_channels: feature_channels, 
+        mid_channels: feature_channels,
+        out_channels: feature_channels,
+        bias: bias 
+    }).apply(b4_out);
+    
+    // IMPORTANT: The second output of the 6th block is needed for the concatenation layer.
+    const [b6_out, b6_intermediate, ] = new SPAB({ 
+        name: 'spab_6', 
+        in_channels: feature_channels, 
+        mid_channels: feature_channels,
+        out_channels: feature_channels,
+        bias: bias 
+    }).apply(b5_out);
+    
+    const conv2 = new Conv3XC({ 
+        name: 'conv_2', 
+        c_in: feature_channels, 
+        c_out: feature_channels, 
+        gain1: 2, 
+        bias: bias 
+    }).apply(b6_out);
+    
+    // Correct concatenation based on the model's architecture
+    const cat = tf.layers.concatenate({ name: 'cat' }).apply([norm, conv2, b1_out, b6_intermediate]);
+    
+    const conv_cat = tf.layers.conv2d({ 
+        name: 'conv_cat', 
+        filters: feature_channels, 
+        kernelSize: 1, 
+        padding: 'same', 
+        useBias: bias 
+    }).apply(cat);
+    
+    const upsampler = tf.layers.conv2d({ 
+        name: 'upsampler', 
+        filters: num_out_ch * (upscale ** 2), 
+        kernelSize: 3, 
+        padding: 'same' 
     }).apply(conv_cat);
-
-    const pixel_shuffled_output = new DepthToSpaceLayer({ name: 'pixel_shuffle', blockSize: upscale }).apply(upsampler_conv);
-
-    const output = tf.layers.activation({ activation: 'sigmoid', name: 'output_sigmoid' }).apply(pixel_shuffled_output);
-
-    const model = tf.model({ inputs: inputs, outputs: output, name: 'SPAN' });
-
-    // This function is no longer needed with the simplified Conv3XC layer for training.
-    // A new version would be required for optimized inference.
-    model.updateAllParams = () => {
-        console.log("Weight fusion for inference is not implemented in this version.");
-    };
-
-    return model;
+    
+    const pixel_shuffle = new DepthToSpaceLayer({ 
+        name: 'pixel_shuffle', 
+        blockSize: upscale 
+    }).apply(upsampler);
+    
+    const output = tf.layers.activation({ 
+        activation: 'sigmoid', 
+        name: 'output' 
+    }).apply(pixel_shuffle);
+    
+    return tf.model({ inputs: inputs, outputs: output, name: 'SPAN_MODEL' });
 }
 
 
 /**
  * Builds the SPAN Generator model.
- * @param {number} feature_channels - Number of filters in convolutional layers.
- * @param {number} scale - Upscaling factor.
+ * @param {number} [feature_channels=48] - Number of filters in convolutional layers.
+ * @param {number} [scale=UPSCALING_FACTOR] - Upscaling factor.
+ * @param {number} [height=INPUT_SIZE] - The input height for the model.
+ * @param {number} [width=INPUT_SIZE] - The input width for the model.
  */
-function buildGenerator(feature_channels = 48, scale = UPSCALING_FACTOR) {
+function buildGenerator(feature_channels = 48, scale = UPSCALING_FACTOR, height = INPUT_SIZE, width = INPUT_SIZE) {
     const generator = createSPANModel({
         num_in_ch: CH_SIZE,
         num_out_ch: CH_SIZE,
@@ -972,8 +1080,12 @@ function buildGenerator(feature_channels = 48, scale = UPSCALING_FACTOR) {
         bias: true,
         img_range: 1.0,
         rgb_mean: [0, 0, 0]
-    });
+    }, height, width); // Pass dynamic size here
+    
+    console.log(`--- Generator Summary for ${height}x${width} input ---`);
     generator.summary();
+    console.log(`------------------------------------`);
+    
     return generator;
 }
 
@@ -988,17 +1100,15 @@ function pixelLoss(hr_real, hr_fake) {
  * Initializes the TensorFlow.js backend.
  */
 async function initializeTfBackend() {
+    // This needs to be called once before any model operations
     registerDepthToSpaceGradient();
-tf.serialization.registerClass(NormalizationLayer);
-tf.serialization.registerClass(SubtractHalfLayer);
-tf.serialization.registerClass(Conv3XC);
-tf.serialization.registerClass(SPAB);
-tf.serialization.registerClass(DepthToSpaceLayer);
+
     updateStatus(`Attempting to set backend to WEBGPU...`);
     try {
         await tf.setBackend('webgpu');
         currentBackend = 'webgpu';
         updateStatus(`Backend: WEBGPU.`);
+        console.log(`Backend set to: ${tf.getBackend()}`);
         return;
     } catch (error) {
         console.warn(`WebGPU initialization failed. Falling back to WebGL.`);
@@ -1009,16 +1119,14 @@ tf.serialization.registerClass(DepthToSpaceLayer);
         await tf.setBackend('webgl');
         currentBackend = 'webgl';
         updateStatus(`Backend: WEBGL.`);
+        console.log(`Backend set to: ${tf.getBackend()}`);
         return;
     } catch (error) {
-        console.warn(`WebGL initialization failed. Falling back to CPU.`);
+        console.error(`WebGL initialization failed. No suitable GPU backend found.`);
+        updateStatus(`Error: No GPU backend (WebGPU or WebGL) is available.`);
     }
-
-    updateStatus(`Setting backend to CPU...`);
-    await tf.setBackend('cpu');
-    currentBackend = 'cpu';
-    updateStatus(`Backend: CPU.`);
 }
+
 
 /**
  * Initializes the Chart.js loss curve chart.
@@ -1098,7 +1206,12 @@ async function runTraining() {
     loadModelInput.disabled = true;
     enhanceImageBtn.disabled = true;
 
-    updateStatus('Creating Generator Model...');
+    updateStatus('Creating Generator Model for Training...');
+    // Dispose of old model if it exists
+    if (generatorModel) {
+        generatorModel.dispose();
+    }
+    // For training, we always use the fixed-size model.
     generatorModel = buildGenerator();
 
     updateStatus('Checking for existing Generator Model...');
@@ -1115,7 +1228,7 @@ async function runTraining() {
             console.log('No existing Generator weights found. Starting fresh.');
         }
     } catch (e) {
-        updateStatus('Error loading weights. Starting fresh.');
+        updateStatus(`Error loading weights: ${e.message}. Starting fresh.`);
         console.error(`Error loading models: ${e.message}`);
     }
 
@@ -1166,6 +1279,7 @@ async function runTraining() {
             updateStatus(`Iteration ${iteration + 1}/${EPOCHS} - Processing: ${file}`);
             tf.engine().startScope();
             try {
+                // For training, we use fixed-size patches which aligns with our static model.
                 const highResPatches = await loadPatchesFromSingleImage(tf, `${IMAGE_DATA_URL_PREFIX}${file}`, BATCH_SIZE, GT_SIZE, updateStatus, getTimestamp);
                 
                 if (highResPatches.shape[0] < BATCH_SIZE) {
@@ -1215,10 +1329,11 @@ async function runTraining() {
         
         updateLossChart(iteration + 1, avgGenLoss, currentLr);
 
-        if ((iteration + 1) % 5000 === 0 && !stopTrainingFlag) {
-            updateStatus(`Saving models at iteration ${iteration + 1}...`);
+        // Save the model to IndexedDB after each iteration.
+        if (!stopTrainingFlag) {
+            updateStatus(`Saving model to IndexedDB after iteration ${iteration + 1}...`);
             await generatorModel.save(MODEL_SAVE_PATH_G);
-            updateStatus(`Models saved at iteration ${iteration + 1}.`);
+            updateStatus(`Model saved after iteration ${iteration + 1}.`);
         }
 
         updateStatus(`Visualizing sample for Iteration ${iteration + 1}...`);
@@ -1240,16 +1355,8 @@ async function runTraining() {
     // After training completes or stops
     etaTimeElement.textContent = 'N/A'; // Clear ETA when training is done
     const totalTrainingDuration = ((performance.now() - trainingStartTime) / 1000).toFixed(2);
-    // You can re-purpose another element or add a new one for total training time if desired.
-    // For now, it will just show N/A.
     
     updateStatus(`Training completed!`);
-
-    if (!stopTrainingFlag) {
-        updateStatus(`Saving final models...`);
-        await generatorModel.save(MODEL_SAVE_PATH_G);
-        updateStatus(`Final models saved to IndexedDB.`);
-    }
 
     startTrainingBtn.disabled = false;
     pauseResumeTrainingBtn.style.display = 'none';
@@ -1265,29 +1372,46 @@ async function runTraining() {
 }
 
 async function saveModelToFile() {
-    if (!generatorModel) {
-        updateStatus('No generator model to save.');
+    // We save the globally available training model. The enhancement model is temporary.
+    const modelToSave = generatorModel || await tf.loadLayersModel(MODEL_LOAD_PATH_G);
+    if (!modelToSave) {
+        updateStatus('No model available to save. Please train or load one.');
         return;
     }
+    
     updateStatus('Saving Generator Model to file...');
-    await generatorModel.save('downloads://span-3xc-generator-model');
+    await modelToSave.save('downloads://span-3xc-generator-model');
     updateStatus('Generator Model downloaded.');
+    if (!generatorModel) modelToSave.dispose(); // Clean up if we loaded it just for this
 }
 
 async function loadModelFromFile(event) {
     if (event.target.files.length === 0) return;
     updateStatus('Loading Generator Model from files...');
+    
+    if (generatorModel) {
+        generatorModel.dispose();
+        generatorModel = null;
+    }
+
     try {
         const files = Array.from(event.target.files);
-        files.sort((a, b) => a.name.endsWith('.json') ? -1 : 1); // Ensure .json comes first
-        // IMPORTANT: Don't call buildGenerator() here!
-        const loadedGenModel = await tf.loadLayersModel(tf.io.browserFiles(files));
+        const jsonFile = files.find(f => f.name.endsWith('.json'));
+        const weightFiles = files.filter(f => f.name.endsWith('.bin'));
+        if (!jsonFile) {
+            throw new Error("Could not find a .json file in the selection.");
+        }
 
-        if (generatorModel) generatorModel.dispose();
-        generatorModel = loadedGenModel;
+        // Load the model from the file. This will become the new base for training.
+        generatorModel = await tf.loadLayersModel(tf.io.browserFiles([jsonFile, ...weightFiles]));
         
-        updateStatus('Generator Model loaded successfully.');
+        // Also save it to IndexedDB so it can be used for enhancement immediately.
+        updateStatus('Saving loaded model to IndexedDB for future use...');
+        await generatorModel.save(MODEL_SAVE_PATH_G);
+
+        updateStatus('Generator Model loaded and saved. Ready for training or enhancement.');
         enhanceImageBtn.disabled = false;
+        generatorModel.summary();
     } catch (error) {
         updateStatus(`Error loading generator model: ${error.message}`);
         console.error('Error loading generator model from files:', error);
@@ -1316,42 +1440,43 @@ async function deleteModel() {
 }
 
 /**
- * Handles the image upload, upscaling, and display.
+ * Handles the image upload by resizing it to 64x64, running enhancement,
+ * and displaying the result.
  */
 async function enhanceImage(event) {
     const file = event.target.files[0];
     if (!file) return;
-    
+
     enhanceResultContainer.innerHTML = '';
     enhanceProcessingOverlay.style.display = 'flex';
     if (spinnerElement) spinnerElement.style.display = 'block';
-    enhanceEtaElement.textContent = 'Calculating...';
-    if (closeOverlayBtn) closeOverlayBtn.style.display = 'none';
 
-    if (!generatorModel) {
-         updateStatus('Please train or load a generator model first. Attempting to load pre-trained model for enhancement...');
-         try {
-            if (!stopTrainingFlag) { 
-                generatorModel = await tf.loadLayersModel(MODEL_LOAD_PATH_G);
-                updateStatus('Pre-trained generator model loaded from IndexedDB. Proceeding with enhancement.');
-            } else {
-                updateStatus('Training is stopping, cannot load model for enhancement.');
-                enhanceProcessingOverlay.style.display = 'none';
-                return;
-            }
-         } catch(e) {
-            updateStatus('Could not load a generator model. Please train one first.');
-            enhanceProcessingOverlay.style.display = 'none';
-            return;
-         }
+    // Set backend
+    try {
+        await tf.setBackend('webgpu');
+    } catch (e1) {
+        console.warn("WebGPU not available, trying WebGL...");
+        try {
+            await tf.setBackend('webgl');
+        } catch (e2) {
+            console.warn("WebGL not available, using CPU.");
+            await tf.setBackend('cpu');
+        }
+    }
+
+    let originalModel;
+    try {
+        originalModel = await tf.loadLayersModel(MODEL_LOAD_PATH_G);
+        updateStatus('Base model loaded.');
+    } catch (e) {
+        updateStatus('Could not load a pre-trained model from IndexedDB. Please train one first.');
+        enhanceProcessingOverlay.style.display = 'none';
+        return;
     }
 
     const startTime = performance.now();
-    
-    tf.engine().startScope();
     try {
-        updateStatus(`Enhancing image: ${file.name}...`);
-        
+        // Load the uploaded image into a tensor
         const uploadedImageTensor = await new Promise((resolve, reject) => {
             const img = new Image();
             img.onload = () => resolve(tf.browser.fromPixels(img).div(255));
@@ -1359,22 +1484,42 @@ async function enhanceImage(event) {
             img.src = URL.createObjectURL(file);
         });
         
-        const lowResInputForModel = uploadedImageTensor.expandDims(0);
-       
-        updateStatus(`Enhancing...`);
-        // Use predict() for inference, which is faster.
-        const upscaledOutput = generatorModel.predict(lowResInputForModel);
+        updateStatus(`Resizing image to ${INPUT_SIZE}x${INPUT_SIZE}...`);
+
+        // --- Main Simplification: Resize image and run prediction ---
+        const enhancedTensor = tf.tidy(() => {
+            // Resize the entire uploaded image to the model's required input size (64x64)
+            const resizedInput = tf.image.resizeBilinear(uploadedImageTensor, [INPUT_SIZE, INPUT_SIZE]);
+
+            // Add a batch dimension so the shape is [1, 64, 64, 3]
+            const batchedInput = resizedInput.expandDims(0);
+
+    originalModel.summary();
+            // Run prediction
+            //const prediction = originalModel.predict(resizedInput);
+batchedInput.print()
+const prediction = originalModel.predict(batchedInput);
+prediction.print()
+            // Remove the batch dimension from the output
+            return prediction.squeeze();
+        });
+
+        // --- Display results ---
+        enhanceResultContainer.innerHTML = '<h3>Enhanced Image:</h3>';
+        // Show the original, un-resized image
+        await displayTensorAsImage(tf, visualizeOriginal(tf, uploadedImageTensor), enhanceResultContainer, 'Your Original Input');
+        // Show the upscaled output
+        await displayTensorAsImage(tf, visualizeGenerated(tf, enhancedTensor), enhanceResultContainer, `Upscaled Output (from 64x64)`);
 
         enhanceEtaElement.textContent = `${((performance.now() - startTime) / 1000).toFixed(2)} seconds`;
-
-        enhanceResultContainer.innerHTML = '<h3>Enhanced Image:</h3>';
-        await displayTensorAsImage(tf, visualizeOriginal(tf, uploadedImageTensor.expandDims(0)), enhanceResultContainer, 'Your Input Image');
-        await displayTensorAsImage(tf, visualizeGenerated(tf, upscaledOutput), enhanceResultContainer, 'Upscaled Output');
-        
         if (spinnerElement) spinnerElement.style.display = 'none';
         if (closeOverlayBtn) closeOverlayBtn.style.display = 'block';
-
         updateStatus('Image enhancement complete!');
+
+        // --- Clean up all tensors ---
+        uploadedImageTensor.dispose();
+        enhancedTensor.dispose();
+
     } catch (error) {
         console.error('Error during enhancement:', error);
         updateStatus(`Error enhancing image: ${error.message}`);
@@ -1382,11 +1527,10 @@ async function enhanceImage(event) {
         if (spinnerElement) spinnerElement.style.display = 'none';
         if (closeOverlayBtn) closeOverlayBtn.style.display = 'block';
     } finally {
-        tf.engine().endScope();
+        if (originalModel) originalModel.dispose();
         logMemoryUsage(tf);
     }
 }
-
 
 document.addEventListener('DOMContentLoaded', async () => {
     statusElement = document.getElementById('status');
@@ -1399,8 +1543,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     pauseResumeTrainingBtn = document.getElementById('pause-resume-training-btn');
     deleteModelBtn = document.getElementById('delete-model-btn');
     stopTrainingBtn = document.getElementById('stop-training-btn');
-    epochTimingElement = document.getElementById('epoch-time'); // Changed from trainingTimeElement
-    etaTimeElement = document.getElementById('eta-time'); // New element
+    epochTimingElement = document.getElementById('epoch-time');
+    etaTimeElement = document.getElementById('eta-time');
     lossChartCanvas = document.getElementById('lossChart');
     enhanceImageInput = document.getElementById('enhance-image-input');
     enhanceImageBtn = document.getElementById('enhance-image-btn');
@@ -1445,8 +1589,10 @@ document.addEventListener('DOMContentLoaded', async () => {
         const modelList = await tf.io.listModels();
         if (modelList[MODEL_SAVE_PATH_G]) {
             enhanceImageBtn.disabled = false;
+            updateStatus('Ready. Found existing model in IndexedDB.');
         } else {
             enhanceImageBtn.disabled = true;
+            updateStatus('Ready. No model in IndexedDB. Please train a model first.');
         }
     } catch (e) {
         console.warn("Could not check for existing model, keeping enhance button disabled:", e);
